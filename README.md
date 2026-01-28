@@ -13,9 +13,11 @@ Extend GitHub Copilot CLI with plugins tailored for .NET MAUI app development.
 ## 📦 Installation
 
 ```bash
-/plugin marketplace add StephaneDelcroix/maui-copilot-plugins
-/plugin add appium-automation
+/plugin install appium-automation@maui-copilot-plugins
+/skills reload
 ```
+
+> **Note:** You may need to run `/skills reload` after installing a plugin for it to become available.
 
 ## 🤝 Contributing
 
@@ -24,7 +26,8 @@ Extend GitHub Copilot CLI with plugins tailored for .NET MAUI app development.
 1. Fork this repository
 2. Add your plugin under `plugins/<plugin-name>/`
 3. Follow the structure of existing plugins
-4. Submit a PR with a description of what your plugin does
+4. Update `.github/plugin/marketplace.json` with your plugin entry
+5. Submit a PR with a description of what your plugin does
 
 ### Plugin Structure
 
