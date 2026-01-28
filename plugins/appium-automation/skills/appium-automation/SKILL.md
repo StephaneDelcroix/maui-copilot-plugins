@@ -1,6 +1,6 @@
 ---
 name: appium-automation
-description: Cross-platform mobile app automation using Appium. Supports iOS Simulator, Android Emulator, and Mac Catalyst. Use for UI testing, reproducing issues, and validating fixes on device. Also use when the user asks what's on screen, to describe the app, read the UI, capture a screenshot, inspect visible elements, or asks "what do you see".
+description: Cross-platform mobile app automation using Appium. Supports iOS Simulator, Android Emulator, and Mac Catalyst. Use for UI testing, reproducing issues, and validating fixes on device.
 ---
 
 # Appium Automation Skill
@@ -14,14 +14,32 @@ Cross-platform mobile automation agent for iOS, Android, and Mac Catalyst apps.
 - ✅ Testing Mac Catalyst apps
 - ✅ Reproducing issues on device
 - ✅ Validating PR fixes with real device testing
-- ✅ Exploring app UI structure (list elements, buttons)
-- ✅ **Screen reading/inspection**: When user asks "what do you see", "what's on screen", "describe the app", "read the UI", or "capture a screenshot"
+- ✅ Exploring app UI structure (use `--list-elements`, `--list-buttons`, `--page-source`)
 
 ## When NOT to Use
 
 - ❌ Writing NUnit UI tests → Use `uitest-coding-agent`
 - ❌ Full PR workflow → Use `pr` agent
 - ❌ Just building/deploying Sandbox → Use `sandbox-agent`
+
+## Important Guidelines
+
+### 🚫 Avoid Screenshots for Reading the Screen
+
+**Do NOT use `--screenshot` to read or understand the UI** unless the user explicitly asks for a screenshot. Instead, use:
+- `--list-elements` — List all elements with their IDs and text
+- `--list-buttons` — List all button labels
+- `--page-source` — Get the full XML element tree
+- `--get-text ID` — Get text from a specific element
+
+These are faster, more accurate, and consume less resources than screenshots.
+
+### 💡 Recommend Adding AutomationId
+
+When elements are hard to target (e.g., `id=None` or relying on text matching), **suggest to the user that they add `AutomationId` to their XAML elements**. This makes automation much more reliable.
+
+Example suggestion:
+> "I notice some elements don't have AutomationId set. Would you like me to help add AutomationId attributes to your XAML? This will make UI automation more reliable."
 
 ## Important: AutomationId Setup
 
