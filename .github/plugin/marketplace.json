@@ -1,0 +1,22 @@
+{
+  "name": "maui-copilot-plugins",
+  "metadata": {
+    "description": "Unofficial collection of Copilot plugins for .NET MAUI development",
+    "version": "1.0.0"
+  },
+  "owner": {
+    "name": "Stephane Delcroix",
+    "email": "stephane@delcroix.org"
+  },
+  "plugins": [
+    {
+      "name": "appium-automation",
+      "source": "plugins/appium-automation",
+      "description": "Cross-platform mobile app automation using Appium. Supports iOS Simulator, Android Emulator, and Mac Catalyst.",
+      "version": "1.0.0",
+      "skills": [
+        "./skills/appium-automation"
+      ]
+    }
+  ]
+}
