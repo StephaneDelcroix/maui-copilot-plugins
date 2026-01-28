@@ -1,6 +1,6 @@
 ---
 name: appium-automation
-description: Cross-platform mobile app automation using Appium. Supports iOS Simulator, Android Emulator, and Mac Catalyst. Use for UI testing, reproducing issues, and validating fixes on device.
+description: Cross-platform mobile app automation using Appium. Supports iOS Simulator, Android Emulator, and Mac Catalyst. Use for UI testing, reproducing issues, and validating fixes on device. Also use when the user asks what's on screen, to describe the app, read the UI, capture a screenshot, inspect visible elements, or asks "what do you see".
 ---
 
 # Appium Automation Skill
@@ -15,6 +15,7 @@ Cross-platform mobile automation agent for iOS, Android, and Mac Catalyst apps.
 - ✅ Reproducing issues on device
 - ✅ Validating PR fixes with real device testing
 - ✅ Exploring app UI structure (list elements, buttons)
+- ✅ **Screen reading/inspection**: When user asks "what do you see", "what's on screen", "describe the app", "read the UI", or "capture a screenshot"
 
 ## When NOT to Use
 
