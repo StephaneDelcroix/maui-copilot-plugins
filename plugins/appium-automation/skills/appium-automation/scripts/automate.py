@@ -1466,10 +1466,13 @@ def start_appium(port: int = 4723, relaxed_security: bool = True) -> subprocess.
     if relaxed_security:
         args.append("--relaxed-security")
     
+    # Redirect to /dev/null to prevent SIGPIPE when parent exits
+    devnull = open(os.devnull, 'w')
     process = subprocess.Popen(
         args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=devnull,
+        stderr=devnull,
+        stdin=subprocess.DEVNULL,
         start_new_session=True
     )
     
@@ -1802,6 +1805,291 @@ def execute_action(agent: 'AppiumAgent', action: str, value: Any) -> bool:
         return True
 
 
+# ==================== Session Server ====================
+# Persistent background server that keeps Appium driver alive between CLI calls.
+# This eliminates the ~10-50s session startup overhead for each command.
+
+AGENT_SERVER_PORT = 14723  # Default port for the session server
+AGENT_SERVER_IDLE_TIMEOUT = 600  # Auto-shutdown after 10 min idle
+
+def _get_server_port(platform: str, app_id: str) -> int:
+    """Deterministic port for a platform+app combo so multiple apps can have servers."""
+    h = int(hashlib.md5(f"{platform}:{app_id}".encode()).hexdigest()[:4], 16)
+    return 15000 + (h % 10000)  # Range 15000-24999
+
+def _is_session_server_running(port: int) -> bool:
+    """Check if a session server is listening on the given port."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        result = sock.connect_ex(("127.0.0.1", port))
+        return result == 0
+    finally:
+        sock.close()
+
+def _session_server_main(platform: str, app_id: str, appium_url: str,
+                         udid: Optional[str], port: int, idle_timeout: int):
+    """
+    Run the session server. This is the entry point for the background daemon.
+    Holds an AppiumAgent in memory and serves commands over HTTP.
+    """
+    import http.server
+    import threading
+    import io
+
+    agent: Optional[AppiumAgent] = None
+    last_activity = time.time()
+    shutdown_event = threading.Event()
+
+    class SessionHandler(http.server.BaseHTTPRequestHandler):
+        """Handle JSON command requests."""
+
+        def log_message(self, format, *args):
+            pass  # Suppress default logging
+
+        def do_POST(self):
+            nonlocal agent, last_activity
+            last_activity = time.time()
+
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+
+            try:
+                request = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                self._respond(400, {"error": "Invalid JSON"})
+                return
+
+            path = self.path
+
+            if path == "/connect":
+                # Create or return existing agent
+                if agent and agent.driver:
+                    self._respond(200, {"status": "already_connected"})
+                    return
+                try:
+                    agent = AppiumAgent(
+                        platform=platform,
+                        app_id=app_id,
+                        appium_url=appium_url,
+                        udid=udid,
+                    )
+                    agent.connect()
+                    self._respond(200, {"status": "connected"})
+                except Exception as e:
+                    self._respond(500, {"error": str(e)})
+                return
+
+            if path == "/execute":
+                if not agent or not agent.driver:
+                    self._respond(503, {"error": "No active session. Send /connect first."})
+                    return
+
+                actions = request.get("actions", [])
+                if not actions:
+                    self._respond(400, {"error": "No actions provided"})
+                    return
+
+                # Capture stdout to return printed output
+                old_stdout = sys.stdout
+                captured = io.StringIO()
+                sys.stdout = captured
+                all_success = True
+                error_msg = None
+                try:
+                    for action_name, action_value in actions:
+                        success = execute_action(agent, action_name, action_value)
+                        if not success:
+                            all_success = False
+                            break
+                except Exception as e:
+                    all_success = False
+                    error_msg = str(e)
+                    # Check if Appium connection died
+                    if "Connection refused" in str(e) or "RemoteDisconnected" in str(e):
+                        print(f"Appium connection lost: {e}", file=old_stdout)
+                        # Mark driver as dead so /connect can recreate it
+                        try:
+                            agent.driver = None
+                        except:
+                            pass
+                finally:
+                    sys.stdout = old_stdout
+
+                output = captured.getvalue()
+                resp_data = {
+                    "success": all_success,
+                    "output": output,
+                }
+                if error_msg:
+                    resp_data["error"] = error_msg
+                self._respond(200, resp_data)
+                return
+
+            if path == "/status":
+                connected = agent is not None and agent.driver is not None
+                self._respond(200, {
+                    "status": "running",
+                    "connected": connected,
+                    "platform": platform,
+                    "app_id": app_id,
+                    "idle_seconds": int(time.time() - last_activity),
+                })
+                return
+
+            if path == "/shutdown":
+                if agent:
+                    try:
+                        agent.disconnect()
+                    except:
+                        pass
+                    agent = None
+                self._respond(200, {"status": "shutting_down"})
+                shutdown_event.set()
+                return
+
+            if path == "/disconnect":
+                if agent:
+                    try:
+                        agent.disconnect()
+                    except:
+                        pass
+                    agent = None
+                self._respond(200, {"status": "disconnected"})
+                return
+
+            self._respond(404, {"error": f"Unknown endpoint: {path}"})
+
+        def do_GET(self):
+            nonlocal last_activity
+            last_activity = time.time()
+            if self.path == "/status":
+                connected = agent is not None and agent.driver is not None
+                self._respond(200, {
+                    "status": "running",
+                    "connected": connected,
+                    "platform": platform,
+                    "app_id": app_id,
+                })
+            else:
+                self._respond(404, {"error": "Use GET /status or POST /execute"})
+
+        def _respond(self, code: int, data: dict):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+
+    # Idle timeout watchdog
+    def watchdog():
+        while not shutdown_event.is_set():
+            if time.time() - last_activity > idle_timeout:
+                print(f"[session-server] Idle timeout ({idle_timeout}s), shutting down", file=sys.stderr)
+                if agent:
+                    try:
+                        agent.disconnect()
+                    except:
+                        pass
+                shutdown_event.set()
+                # Force the server socket to close
+                try:
+                    server.shutdown()
+                except:
+                    pass
+                return
+            shutdown_event.wait(10)
+
+    server = http.server.HTTPServer(("127.0.0.1", port), SessionHandler)
+    server.timeout = 1
+
+    watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+    watchdog_thread.start()
+
+    print(f"[session-server] Listening on 127.0.0.1:{port} (platform={platform}, app={app_id})", file=sys.stderr)
+    print(f"[session-server] Idle timeout: {idle_timeout}s", file=sys.stderr)
+
+    try:
+        while not shutdown_event.is_set():
+            server.handle_request()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if agent:
+            try:
+                agent.disconnect()
+            except:
+                pass
+        server.server_close()
+        print("[session-server] Stopped", file=sys.stderr)
+
+
+def _start_session_server(platform: str, app_id: str, appium_url: str,
+                          udid: Optional[str], port: int) -> bool:
+    """Start session server as a background daemon. Returns True if started."""
+    if _is_session_server_running(port):
+        return True
+
+    # Launch as background process
+    cmd = [
+        sys.executable, __file__,
+        "--serve",
+        "--platform", platform,
+        "--app-id", app_id,
+        "--appium-url", appium_url,
+        "--server-port", str(port),
+    ]
+    if udid:
+        cmd.extend(["--udid", udid])
+
+    # Write server stderr to a log file instead of PIPE (PIPE breaks when parent exits)
+    log_dir = Path("/tmp/appium-sessions")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    server_log = open(log_dir / f"server_{port}.log", "w")
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=server_log,
+        start_new_session=True,
+    )
+
+    # Wait for server to start
+    for _ in range(50):  # 5 seconds max
+        if _is_session_server_running(port):
+            return True
+        time.sleep(0.1)
+
+    # Check if process died
+    if process.poll() is not None:
+        try:
+            log_content = (log_dir / f"server_{port}.log").read_text()
+        except:
+            log_content = ""
+        print(f"Session server failed to start: {log_content}", file=sys.stderr)
+        return False
+
+    return False
+
+
+def _send_to_server(port: int, path: str, data: Optional[dict] = None,
+                    method: str = "POST") -> Optional[dict]:
+    """Send a request to the session server. Returns response dict or None."""
+    import urllib.request
+    url = f"http://127.0.0.1:{port}{path}"
+
+    if method == "GET":
+        req = urllib.request.Request(url, method="GET")
+    else:
+        body = json.dumps(data).encode() if data else b"{}"
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        return None
+
+
 # ==================== CLI Interface ====================
 
 def main():
@@ -1893,16 +2181,43 @@ Examples:
     parser.add_argument("--boot-simulator", type=str, help="Boot iOS simulator by name/UDID")
     parser.add_argument("--start-appium", action="store_true", help="Start Appium server")
     
-    # Session caching (performance)
+    # Session persistence (default behavior - transparent to user)
+    parser.add_argument("--no-server", action="store_true",
+                       help="Bypass session server, connect directly (slow but simple)")
+    parser.add_argument("--server-status", action="store_true",
+                       help="Show session server status")
+    parser.add_argument("--server-stop", action="store_true",
+                       help="Stop the session server for this platform/app")
+    
+    # Legacy session caching (kept for backward compat, now no-ops)
     parser.add_argument("--keep-session", action="store_true", 
-                       help="Keep session alive for reuse (faster subsequent calls)")
+                       help="(Legacy, now default) Keep session alive for reuse")
     parser.add_argument("--reuse-session", action="store_true",
-                       help="Try to reuse a cached session")
+                       help="(Legacy, now default) Reuse cached session")
     parser.add_argument("--end-session", action="store_true",
-                       help="End all cached sessions")
+                       help="End all cached sessions and stop server")
+
+    # Internal: session server mode
+    parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--server-port", type=int, default=0, help=argparse.SUPPRESS)
     
     args = parser.parse_args()
     
+    # ---- Internal: session server daemon mode ----
+    if args.serve:
+        if not args.platform or not args.app_id:
+            parser.error("--platform and --app-id required for --serve")
+        port = args.server_port or _get_server_port(args.platform, args.app_id)
+        _session_server_main(
+            platform=args.platform,
+            app_id=args.app_id,
+            appium_url=args.appium_url,
+            udid=args.udid,
+            port=port,
+            idle_timeout=AGENT_SERVER_IDLE_TIMEOUT,
+        )
+        return
+
     # Handle device management commands (no connection needed)
     if args.list_devices:
         print("iOS Simulators:")
@@ -1931,14 +2246,59 @@ Examples:
         return
     
     if args.end_session:
+        # Stop server if running, then clean up legacy cache
+        if args.platform and args.app_id:
+            port = _get_server_port(args.platform, args.app_id)
+            if _is_session_server_running(port):
+                _send_to_server(port, "/shutdown")
+                print("Session server stopped")
         AppiumAgent.end_all_sessions(args.appium_url)
         print("All cached sessions ended")
+        return
+
+    # ---- Server status/stop commands ----
+    if args.server_status:
+        if not args.platform or not args.app_id:
+            parser.error("--platform and --app-id required for --server-status")
+        port = _get_server_port(args.platform, args.app_id)
+        if _is_session_server_running(port):
+            resp = _send_to_server(port, "/status", method="GET")
+            if resp:
+                connected = resp.get("connected", False)
+                idle = resp.get("idle_seconds", 0)
+                print(f"Session server: running on port {port}")
+                print(f"  Platform: {resp.get('platform')}")
+                print(f"  App: {resp.get('app_id')}")
+                print(f"  Driver connected: {connected}")
+                print(f"  Idle: {idle}s")
+            else:
+                print(f"Session server: running on port {port} (no response)")
+        else:
+            print("Session server: not running")
+        return
+
+    if args.server_stop:
+        if not args.platform or not args.app_id:
+            parser.error("--platform and --app-id required for --server-stop")
+        port = _get_server_port(args.platform, args.app_id)
+        if _is_session_server_running(port):
+            _send_to_server(port, "/shutdown")
+            print("Session server stopped")
+        else:
+            print("Session server: not running")
         return
     
     # Validate required args for automation commands
     if not args.platform or not args.app_id:
         parser.error("--platform and --app-id are required for automation commands")
     
+    # Parse actions early - if none, bail
+    ordered_actions = parse_ordered_actions(sys.argv)
+    if not ordered_actions:
+        print("No actions specified. Use --help for usage.")
+        return
+    
+    # Ensure Appium is running
     if not is_appium_running(args.appium_url):
         print("Appium not running, starting automatically...")
         try:
@@ -1949,7 +2309,92 @@ Examples:
             print("Start manually with: appium --relaxed-security")
             sys.exit(1)
     
-    # Run automation
+    # ---- Route through session server (default) or direct ----
+    if not args.no_server:
+        port = _get_server_port(args.platform, args.app_id)
+        
+        def _ensure_server_running():
+            """Start server if not running, return True if ready."""
+            if _is_session_server_running(port):
+                # Verify it actually responds (port might be stale)
+                resp = _send_to_server(port, "/status", method="GET")
+                if resp:
+                    return True
+                # Port open but not responding — stale process, wait for it to clear
+                time.sleep(1)
+            
+            return _start_session_server(
+                platform=args.platform,
+                app_id=args.app_id,
+                appium_url=args.appium_url,
+                udid=args.udid,
+                port=port,
+            )
+        
+        server_ready = _ensure_server_running()
+        if not server_ready:
+            print("Warning: Session server failed to start, falling back to direct mode",
+                  file=sys.stderr)
+            args.no_server = True
+        
+        if not args.no_server:
+            def _ensure_connected():
+                """Ensure Appium is running and driver is connected."""
+                # Check Appium first
+                if not is_appium_running(args.appium_url):
+                    print("Appium not running, starting...", file=sys.stderr)
+                    start_appium()
+
+                resp = _send_to_server(port, "/status", method="GET")
+                if resp and not resp.get("connected"):
+                    connect_resp = _send_to_server(port, "/connect")
+                    if not connect_resp or "error" in connect_resp:
+                        err = connect_resp.get("error", "unknown") if connect_resp else "no response"
+                        return False, err
+                return True, None
+
+            ok, err = _ensure_connected()
+            if not ok:
+                print(f"Error connecting: {err}", file=sys.stderr)
+                sys.exit(1)
+
+            # Send actions to server
+            resp = _send_to_server(port, "/execute", {
+                "actions": ordered_actions,
+            })
+
+            # Handle failures with retry
+            needs_retry = False
+            if resp is None:
+                needs_retry = True
+            elif resp.get("error") and ("Connection refused" in resp.get("error", "")
+                                        or "RemoteDisconnected" in resp.get("error", "")):
+                needs_retry = True
+
+            if needs_retry:
+                print("Appium connection lost, reconnecting...", file=sys.stderr)
+                # Ensure Appium is running, reconnect driver
+                _ensure_server_running()
+                ok, err = _ensure_connected()
+                if ok:
+                    resp = _send_to_server(port, "/execute", {
+                        "actions": ordered_actions,
+                    })
+                if resp is None:
+                    print("Error: Session server not responding after reconnect",
+                          file=sys.stderr)
+                    sys.exit(1)
+
+            # Print captured output from server
+            output = resp.get("output", "")
+            if output:
+                print(output, end="")
+
+            if not resp.get("success", True):
+                sys.exit(1)
+            return
+    
+    # ---- Direct mode (--no-server or fallback) ----
     with AppiumAgent(
         platform=args.platform,
         app_id=args.app_id,
@@ -1959,18 +2404,9 @@ Examples:
         reuse_session=args.reuse_session,
         keep_session=args.keep_session,
     ) as agent:
-        
-        # Parse actions in CLI order and execute them
-        ordered_actions = parse_ordered_actions(sys.argv)
-        
-        if not ordered_actions:
-            print("No actions specified. Use --help for usage.")
-            return
-        
         for action, value in ordered_actions:
             success = execute_action(agent, action, value)
             if not success:
-                # Assertion failed
                 sys.exit(1)
 
 

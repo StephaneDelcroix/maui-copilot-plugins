@@ -274,7 +274,7 @@ python .github/skills/appium-automation/scripts/automate.py \
   --get-text WelcomeLabel
 ```
 
-> **Performance Tip**: Chain multiple operations in a single CLI call. Each invocation creates a new Appium session (~10-50s on iOS). Chaining operations runs them all in one session, making subsequent operations nearly instant.
+> **Performance Note**: The session server is now the default — subsequent CLI calls reuse the same Appium session (~0.3-1s each). You can still chain operations in a single call for atomic execution.
 
 ### Debug: Explore App Structure
 
@@ -387,32 +387,38 @@ Or use a Release build which embeds assemblies by default.
 
 **Symptom**: Each CLI call takes 10-50 seconds on iOS.
 
-**Cause**: Each CLI invocation creates a new Appium/WebDriverAgent session. Session startup is slow, especially on iOS (~10-50s).
+**Cause**: Creating a new Appium/WebDriverAgent session is slow (~10-50s on iOS).
 
-**Fix 1**: Use session caching with `--keep-session` and `--reuse-session`:
+**Default behavior**: The agent now uses a **persistent session server** that keeps the Appium driver alive between CLI calls. The first call takes ~15-20s (starts server + creates session), but subsequent calls complete in **~0.3-1s**.
+
 ```bash
-# First call creates session and keeps it alive (~10s)
-python automate.py --platform ios --app-id com.example --keep-session --tap Field1
+# First call: starts server + creates session (~15-20s)
+python automate.py --platform ios --app-id com.example --tap Field1
 
-# Subsequent calls reuse the session (~2s each!)
-python automate.py --platform ios --app-id com.example --reuse-session --keep-session --type Field1 "text"
-python automate.py --platform ios --app-id com.example --reuse-session --keep-session --list-elements
+# Subsequent calls: reuse session (~0.3-1s each!)
+python automate.py --platform ios --app-id com.example --type Field1 "text"
+python automate.py --platform ios --app-id com.example --list-elements
+python automate.py --platform ios --app-id com.example --get-text Result
 
-# When done, end the session
-python automate.py --end-session
+# Check server status
+python automate.py --platform ios --app-id com.example --server-status
+
+# Stop the server when done
+python automate.py --platform ios --app-id com.example --server-stop
 ```
 
-**Fix 2**: Chain multiple operations in a single CLI call:
+**Session server details**:
+- Auto-starts on first CLI call (no manual setup needed)
+- Auto-stops after 10 minutes of inactivity
+- Each platform+app combo gets its own server on a unique port
+- Use `--no-server` to bypass and connect directly (old behavior)
+- Use `--server-stop` to explicitly stop a running server
+
+**Alternative**: Chain multiple operations in a single CLI call:
 ```bash
-# 1 session for all operations - executed IN ORDER specified!
+# All operations in one session
 python automate.py --platform ios --app-id com.example \
   --tap Field1 --type Field1 "text" --get-text Result --expect Result "success"
-```
-
-**Note**: Actions are executed in the order you specify on the command line. You can interleave actions as needed:
-```bash
-# Type, check value, type more, check again
---type Amount 100 --get-text Total --type Tip 20 --expect Total "€ 120"
 ```
 
 ## Assertions
